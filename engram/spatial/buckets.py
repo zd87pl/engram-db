@@ -7,6 +7,7 @@ that intersect it so we can use a ``MatchAny`` filter in Qdrant.
 from __future__ import annotations
 
 import itertools
+import math
 
 from engram.spatial.hilbert import _DEFAULT_ORDER, _clamp, _make_curve
 
@@ -64,8 +65,6 @@ def expand_bounding_box(
     # every grid cell that could contain a point quantised with round()
     # is included.  This fixes a mismatch where encode() uses round()
     # but the old code used int() (truncation), causing boundary misses.
-    import math
-
     ix_lo = _clamp(math.floor(x_min * side), 0, side)
     ix_hi = _clamp(math.ceil(x_max * side), 0, side)
     iy_lo = _clamp(math.floor(y_min * side), 0, side)

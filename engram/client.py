@@ -257,9 +257,13 @@ class EngramClient:
                 t_max_norm,
                 resolution_order=self._spatial_resolution,
             )
-            must_conditions.append(
-                FieldCondition(key="hilbert_id", match=MatchAny(any=hids))
-            )
+            if hids:
+                must_conditions.append(
+                    FieldCondition(key="hilbert_id", match=MatchAny(any=hids))
+                )
+            else:
+                # No grid cells overlap the bounding box — no results possible.
+                return []
 
         if time_window_ms is not None:
             must_conditions.append(
