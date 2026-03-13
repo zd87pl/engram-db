@@ -1,0 +1,425 @@
+"""Main EngramClient class — primary API surface for the Engram database."""
+
+from __future__ import annotations
+
+import time
+import uuid
+from typing import Callable
+
+from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchAny,
+    MatchValue,
+    PayloadSchemaType,
+    PointStruct,
+    Range,
+    SearchRequest,
+    VectorParams,
+)
+
+from engram.retrieval.predict import predict_and_retrieve as _predict_and_retrieve
+from engram.schema import WorldState
+from engram.spatial.buckets import expand_bounding_box
+from engram.spatial.hilbert import encode as hilbert_encode
+from engram.temporal.decay import apply_decay
+from engram.temporal.sharding import collection_name, epoch_id, epochs_in_range
+
+
+class EngramClient:
+    """High-level client for inserting, querying, and navigating WorldStates.
+
+    Wraps a Qdrant instance and adds Hilbert-curve spatial bucketing,
+    temporal sharding, and predict-then-retrieve on top.
+
+    Args:
+        qdrant_url: URL of the Qdrant instance (e.g. ``"http://localhost:6333"``).
+        epoch_size_ms: Width of each temporal shard in milliseconds.
+        spatial_resolution: Hilbert curve resolution order (bits per dimension).
+        vector_size: Dimensionality of the embedding vectors.
+        decay_lambda: Temporal decay rate for recency weighting.
+    """
+
+    def __init__(
+        self,
+        qdrant_url: str,
+        epoch_size_ms: int = 5000,
+        spatial_resolution: int = 4,
+        vector_size: int = 512,
+        decay_lambda: float = 1e-4,
+    ) -> None:
+        self._qdrant = QdrantClient(url=qdrant_url)
+        self._epoch_size_ms = epoch_size_ms
+        self._spatial_resolution = spatial_resolution
+        self._vector_size = vector_size
+        self._decay_lambda = decay_lambda
+        self._known_collections: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Collection management
+    # ------------------------------------------------------------------
+
+    def _ensure_collection(self, name: str) -> None:
+        """Create a Qdrant collection if it does not already exist (idempotent)."""
+        if name in self._known_collections:
+            return
+        try:
+            self._qdrant.get_collection(name)
+        except (UnexpectedResponse, Exception):
+            self._qdrant.create_collection(
+                collection_name=name,
+                vectors_config=VectorParams(
+                    size=self._vector_size,
+                    distance=Distance.COSINE,
+                ),
+            )
+            self._qdrant.create_payload_index(
+                collection_name=name,
+                field_name="hilbert_id",
+                field_schema=PayloadSchemaType.INTEGER,
+            )
+            self._qdrant.create_payload_index(
+                collection_name=name,
+                field_name="timestamp_ms",
+                field_schema=PayloadSchemaType.INTEGER,
+            )
+        self._known_collections.add(name)
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def insert(self, state: WorldState) -> str:
+        """Insert a single WorldState into the store.
+
+        Args:
+            state: The world state to persist.
+
+        Returns:
+            The unique ID assigned to this state.
+        """
+        point_id = uuid.uuid4().hex
+        state.id = point_id
+
+        ep = epoch_id(state.timestamp_ms, self._epoch_size_ms)
+        col = collection_name(ep)
+        self._ensure_collection(col)
+
+        t_norm = self._normalise_time(state.timestamp_ms, ep)
+        hid = hilbert_encode(
+            state.x,
+            state.y,
+            state.z,
+            t_norm,
+            resolution_order=self._spatial_resolution,
+        )
+
+        self._qdrant.upsert(
+            collection_name=col,
+            points=[
+                PointStruct(
+                    id=point_id,
+                    vector=state.vector,
+                    payload=self._state_to_payload(state, hid),
+                ),
+            ],
+        )
+        return point_id
+
+    def insert_batch(self, states: list[WorldState]) -> list[str]:
+        """Insert a batch of WorldStates efficiently.
+
+        Vectors are grouped by epoch and upserted in a single Qdrant
+        call per collection.
+
+        Args:
+            states: List of world states.
+
+        Returns:
+            List of assigned IDs (same order as *states*).
+        """
+        # Group points by collection
+        groups: dict[str, list[PointStruct]] = {}
+        ids: list[str] = []
+
+        for state in states:
+            point_id = uuid.uuid4().hex
+            state.id = point_id
+            ids.append(point_id)
+
+            ep = epoch_id(state.timestamp_ms, self._epoch_size_ms)
+            col = collection_name(ep)
+            self._ensure_collection(col)
+
+            t_norm = self._normalise_time(state.timestamp_ms, ep)
+            hid = hilbert_encode(
+                state.x,
+                state.y,
+                state.z,
+                t_norm,
+                resolution_order=self._spatial_resolution,
+            )
+            point = PointStruct(
+                id=point_id,
+                vector=state.vector,
+                payload=self._state_to_payload(state, hid),
+            )
+            groups.setdefault(col, []).append(point)
+
+        for col, points in groups.items():
+            self._qdrant.upsert(collection_name=col, points=points)
+
+        return ids
+
+    # ------------------------------------------------------------------
+    # Read — standard
+    # ------------------------------------------------------------------
+
+    def query(
+        self,
+        vector: list[float],
+        spatial_bounds: dict | None = None,
+        time_window_ms: tuple[int, int] | None = None,
+        limit: int = 10,
+        *,
+        _extra_payload_filter: dict | None = None,
+    ) -> list[WorldState]:
+        """Search for nearest neighbours with spatial and temporal filtering.
+
+        Args:
+            vector: Query embedding vector.
+            spatial_bounds: Optional dict with keys ``x_min``, ``x_max``,
+                ``y_min``, ``y_max``, ``z_min``, ``z_max``.
+            time_window_ms: Optional ``(start_ms, end_ms)`` window.
+            limit: Maximum number of results.
+
+        Returns:
+            List of :class:`WorldState` results sorted by (optionally
+            decay-weighted) similarity.
+        """
+        # Determine which collections to search
+        if time_window_ms is not None:
+            start_ms, end_ms = time_window_ms
+            epochs = epochs_in_range(start_ms, end_ms, self._epoch_size_ms)
+        else:
+            epochs = self._list_active_epochs()
+
+        collections = [collection_name(e) for e in epochs]
+
+        # Build Qdrant filter conditions
+        must_conditions: list = []
+
+        if spatial_bounds is not None:
+            t_min_norm = 0.0
+            t_max_norm = 1.0
+            hids = expand_bounding_box(
+                spatial_bounds.get("x_min", 0.0),
+                spatial_bounds.get("x_max", 1.0),
+                spatial_bounds.get("y_min", 0.0),
+                spatial_bounds.get("y_max", 1.0),
+                spatial_bounds.get("z_min", 0.0),
+                spatial_bounds.get("z_max", 1.0),
+                t_min_norm,
+                t_max_norm,
+                resolution_order=self._spatial_resolution,
+            )
+            must_conditions.append(
+                FieldCondition(key="hilbert_id", match=MatchAny(any=hids))
+            )
+
+        if time_window_ms is not None:
+            must_conditions.append(
+                FieldCondition(
+                    key="timestamp_ms",
+                    range=Range(gte=start_ms, lte=end_ms),
+                )
+            )
+
+        if _extra_payload_filter:
+            for key, value in _extra_payload_filter.items():
+                must_conditions.append(
+                    FieldCondition(key=key, match=MatchValue(value=value))
+                )
+
+        query_filter = Filter(must=must_conditions) if must_conditions else None
+
+        # Search across all relevant collections
+        all_results: list[dict] = []
+        for col in collections:
+            if col not in self._known_collections:
+                continue
+            try:
+                hits = self._qdrant.search(
+                    collection_name=col,
+                    query_vector=vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                )
+            except Exception:
+                continue
+            for hit in hits:
+                all_results.append(
+                    {
+                        "score": hit.score,
+                        "timestamp_ms": hit.payload.get("timestamp_ms", 0),
+                        "payload": hit.payload,
+                        "id": hit.id,
+                    }
+                )
+
+        # Apply temporal decay and re-rank
+        now_ms = int(time.time() * 1000)
+        apply_decay(all_results, now_ms, self._decay_lambda)
+        all_results = all_results[:limit]
+
+        return [self._payload_to_state(r["payload"], r["id"]) for r in all_results]
+
+    # ------------------------------------------------------------------
+    # Read — novel primitive
+    # ------------------------------------------------------------------
+
+    def predict_and_retrieve(
+        self,
+        context_vector: list[float],
+        predictor_fn: Callable[[list[float]], list[float]],
+        future_horizon_ms: int = 1000,
+        limit: int = 5,
+    ) -> list[WorldState]:
+        """Predict a future state then retrieve nearest neighbours to it.
+
+        Args:
+            context_vector: Current-state embedding.
+            predictor_fn: User-supplied world model. Maps an embedding
+                to a predicted future embedding.
+            future_horizon_ms: How far ahead to search (milliseconds).
+            limit: Maximum number of results.
+
+        Returns:
+            List of :class:`WorldState` neighbours of the predicted vector.
+        """
+        return _predict_and_retrieve(
+            self,
+            context_vector,
+            predictor_fn,
+            future_horizon_ms=future_horizon_ms,
+            limit=limit,
+        )
+
+    # ------------------------------------------------------------------
+    # Temporal navigation
+    # ------------------------------------------------------------------
+
+    def get_trajectory(
+        self,
+        state_id: str,
+        steps_back: int = 10,
+        steps_forward: int = 10,
+    ) -> list[WorldState]:
+        """Follow causal links to reconstruct a trajectory.
+
+        Args:
+            state_id: ID of the anchor state.
+            steps_back: Number of predecessors to follow.
+            steps_forward: Number of successors to follow.
+
+        Returns:
+            Ordered list of states from oldest to newest.
+        """
+        anchor = self._get_state_by_id(state_id)
+        if anchor is None:
+            return []
+
+        backward: list[WorldState] = []
+        current = anchor
+        for _ in range(steps_back):
+            if current.prev_state_id is None:
+                break
+            prev = self._get_state_by_id(current.prev_state_id)
+            if prev is None:
+                break
+            backward.append(prev)
+            current = prev
+        backward.reverse()
+
+        forward: list[WorldState] = []
+        current = anchor
+        for _ in range(steps_forward):
+            if current.next_state_id is None:
+                break
+            nxt = self._get_state_by_id(current.next_state_id)
+            if nxt is None:
+                break
+            forward.append(nxt)
+            current = nxt
+
+        return backward + [anchor] + forward
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _normalise_time(self, timestamp_ms: int, ep: int) -> float:
+        """Map a timestamp to [0, 1] within its epoch."""
+        epoch_start = ep * self._epoch_size_ms
+        offset = timestamp_ms - epoch_start
+        return min(1.0, max(0.0, offset / self._epoch_size_ms))
+
+    @staticmethod
+    def _state_to_payload(state: WorldState, hilbert_id: int) -> dict:
+        return {
+            "x": state.x,
+            "y": state.y,
+            "z": state.z,
+            "timestamp_ms": state.timestamp_ms,
+            "hilbert_id": hilbert_id,
+            "scene_id": state.scene_id,
+            "scale_level": state.scale_level,
+            "confidence": state.confidence,
+            "prev_state_id": state.prev_state_id,
+            "next_state_id": state.next_state_id,
+        }
+
+    @staticmethod
+    def _payload_to_state(payload: dict, point_id: str) -> WorldState:
+        return WorldState(
+            x=payload["x"],
+            y=payload["y"],
+            z=payload["z"],
+            timestamp_ms=payload["timestamp_ms"],
+            vector=[],  # vectors are not returned in payload
+            scene_id=payload.get("scene_id", ""),
+            scale_level=payload.get("scale_level", "patch"),
+            confidence=payload.get("confidence", 1.0),
+            prev_state_id=payload.get("prev_state_id"),
+            next_state_id=payload.get("next_state_id"),
+            id=str(point_id),
+        )
+
+    def _get_state_by_id(self, state_id: str) -> WorldState | None:
+        """Retrieve a single state by its ID (scans known collections)."""
+        for col in list(self._known_collections):
+            try:
+                results = self._qdrant.retrieve(
+                    collection_name=col,
+                    ids=[state_id],
+                    with_payload=True,
+                )
+                if results:
+                    return self._payload_to_state(results[0].payload, results[0].id)
+            except Exception:
+                continue
+        return None
+
+    def _list_active_epochs(self) -> list[int]:
+        """Return epoch IDs for all known collections."""
+        epochs: list[int] = []
+        for col in self._known_collections:
+            if col.startswith("engram_"):
+                try:
+                    epochs.append(int(col.split("_", 1)[1]))
+                except ValueError:
+                    pass
+        return sorted(epochs) if epochs else [0]
