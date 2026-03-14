@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -10,7 +9,6 @@ import pytest
 
 from engram.async_client import AsyncEngramClient
 from engram.schema import WorldState
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -60,8 +58,12 @@ def async_client(mock_async_qdrant):
 
 def _make_state(**overrides) -> WorldState:
     defaults = dict(
-        x=0.5, y=0.5, z=0.5, timestamp_ms=10_000,
-        vector=[1.0, 2.0, 3.0, 4.0], scene_id="test_scene",
+        x=0.5,
+        y=0.5,
+        z=0.5,
+        timestamp_ms=10_000,
+        vector=[1.0, 2.0, 3.0, 4.0],
+        scene_id="test_scene",
     )
     defaults.update(overrides)
     return WorldState(**defaults)
@@ -93,8 +95,10 @@ async def test_ensure_collection_propagates_500(mock_async_qdrant):
 
     mock_async_qdrant.get_collection = AsyncMock(
         side_effect=UnexpectedResponse(
-            status_code=500, reason_phrase="Internal",
-            content=b"", headers=httpx.Headers(),
+            status_code=500,
+            reason_phrase="Internal",
+            content=b"",
+            headers=httpx.Headers(),
         )
     )
     client = AsyncEngramClient.__new__(AsyncEngramClient)
@@ -210,7 +214,9 @@ async def test_query_with_vectors(async_client, mock_async_qdrant):
     hit.id = "abc123"
     hit.vector = [1.0, 2.0, 3.0, 4.0]
     hit.payload = {
-        "x": 0.5, "y": 0.5, "z": 0.5,
+        "x": 0.5,
+        "y": 0.5,
+        "z": 0.5,
         "timestamp_ms": 10_000,
         "scene_id": "s1",
         "scale_level": "patch",
@@ -287,8 +293,6 @@ async def test_predict_and_retrieve(async_client, mock_async_qdrant):
 
 @pytest.mark.asyncio
 async def test_context_manager(mock_async_qdrant):
-    async with AsyncEngramClient(
-        qdrant_url="http://fake:6333", vector_size=4
-    ) as client:
+    async with AsyncEngramClient(qdrant_url="http://fake:6333", vector_size=4) as client:
         assert isinstance(client, AsyncEngramClient)
     mock_async_qdrant.close.assert_called_once()
